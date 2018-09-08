@@ -1,13 +1,20 @@
 package net.bytebuddy.build;
 
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.ClassFileVersion;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.dynamic.DynamicType;
+import net.bytebuddy.dynamic.scaffold.inline.MethodNameTransformer;
+import net.bytebuddy.implementation.LoadedTypeInitializer;
 import net.bytebuddy.matcher.ElementMatcher;
+import net.bytebuddy.pool.TypePool;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.*;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 /**
  * A plugin that allows for the application of Byte Buddy transformations during a build process. This plugin's
@@ -123,6 +130,195 @@ public interface Plugin extends ElementMatcher<TypeDescription> {
                 }
             }
             return false;
+        }
+    }
+
+    class Engine {
+
+        ClassFileVersion classFileVersion;
+
+        EntryPoint entryPoint;
+
+        MethodNameTransformer methodNameTransformer;
+
+        ClassFileLocator classFileLocator;
+
+        TypePool typePool;
+
+        List<Plugin> plugins;
+
+        boolean failFast;
+
+        boolean failOnLiveInitializer;
+
+        public void apply(Source source) throws IOException {
+            apply(source, Listener.NoOp.INSTANCE);
+        }
+
+        public void apply(Source source, Listener listener) throws IOException {
+            ByteBuddy byteBuddy = entryPoint.byteBuddy(classFileVersion);
+            for (Source.Element element : source) {
+                TypePool.Resolution resolution = typePool.describe(element.getName());
+                boolean transformed = false, failed = false;
+                if (resolution.isResolved()) {
+                    TypeDescription typeDescription = resolution.resolve();
+                    DynamicType.Builder<?> builder = entryPoint.transform(typeDescription, byteBuddy, classFileLocator, methodNameTransformer);
+                    for (Plugin plugin : plugins) {
+                        try {
+                            if (plugin.matches(typeDescription)) {
+                                builder = plugin.apply(builder, typeDescription, classFileLocator);
+                                transformed = true;
+                            }
+                        } catch (RuntimeException exception) {
+                            if (failFast) {
+                                throw exception;
+                            } else {
+                                listener.onFailure(typeDescription, exception);
+                                failed = true;
+                            }
+                        }
+                    }
+                    if (failed) {
+                        listener.onFailure(typeDescription);
+                    } else if (transformed) {
+                        DynamicType dynamicType = builder.make();
+                        for (Map.Entry<TypeDescription, LoadedTypeInitializer> entry : dynamicType.getLoadedTypeInitializers().entrySet()) {
+                            if (failOnLiveInitializer && entry.getValue().isAlive()) {
+                                throw new IllegalStateException("Cannot apply live initializer for " + entry.getKey());
+                            }
+                        }
+                        element.replace(dynamicType);
+                        listener.onSuccess(typeDescription);
+                    } else {
+                        element.retain();
+                        listener.onIgnore(typeDescription);
+                    }
+                } else {
+                    listener.onUnresolved(element.getName());
+                }
+            }
+        }
+
+        interface Source extends Iterable<Source.Element>, Closeable {
+
+            interface Element {
+
+                String getName();
+
+                void retain();
+
+                void replace(DynamicType dynamicType) throws IOException;
+            }
+
+            class ForJarFile implements Source {
+
+                private final JarFile jarFile;
+
+                public ForJarFile(JarFile jarFile) {
+                    this.jarFile = jarFile;
+                }
+
+                @Override
+                public Iterator<Element> iterator() {
+                    return new JarFileIterator(jarFile.entries());
+                }
+
+                @Override
+                public void close() throws IOException {
+
+                }
+
+                protected class JarFileIterator implements Iterator<Element> {
+
+                    private final Enumeration<JarEntry> enumeration;
+
+                    protected JarFileIterator(Enumeration<JarEntry> enumeration) {
+                        this.enumeration = enumeration;
+                    }
+
+                    @Override
+                    public boolean hasNext() {
+                        return enumeration.hasMoreElements();
+                    }
+
+                    @Override
+                    public Element next() {
+                        return new JarFileElement(enumeration.nextElement());
+                    }
+
+                    @Override
+                    public void remove() {
+
+                    }
+
+                    protected class JarFileElement implements Element {
+
+                        private final JarEntry entry;
+
+                        protected JarFileElement(JarEntry entry) {
+                            this.entry = entry;
+                        }
+
+                        @Override
+                        public String getName() {
+                            return entry.getName();
+                        }
+
+                        @Override
+                        public void retain() {
+
+                        }
+
+                        @Override
+                        public void replace(DynamicType dynamicType) throws IOException {
+
+                        }
+                    }
+                }
+            }
+        }
+
+        interface Listener {
+
+            void onSuccess(TypeDescription typeDescription);
+
+            void onIgnore(TypeDescription typeDescription);
+
+            void onFailure(TypeDescription typeDescription, Throwable throwable);
+
+            void onFailure(TypeDescription typeDescription);
+
+            void onUnresolved(String name);
+
+            enum NoOp implements Listener {
+
+                INSTANCE;
+
+                @Override
+                public void onSuccess(TypeDescription typeDescription) {
+                    /* do nothing */
+                }
+
+                @Override
+                public void onIgnore(TypeDescription typeDescription) {
+                    /* do nothing */
+                }
+
+                @Override
+                public void onFailure(TypeDescription typeDescription, Throwable throwable) {
+                    /* do nothing */
+                }
+
+                @Override
+                public void onFailure(TypeDescription typeDescription) {
+                    /* do nothing */
+                }
+
+                @Override
+                public void onUnresolved(String name) {
+                    /* do nothing */
+                }
+            }
         }
     }
 }
